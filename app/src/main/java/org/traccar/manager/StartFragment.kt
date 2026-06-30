@@ -103,7 +103,7 @@ class StartFragment : Fragment(), View.OnClickListener {
         PreferenceManager.getDefaultSharedPreferences(activity)
             .edit().putString(MainActivity.PREFERENCE_URL, serverField.text.toString()).apply()
         activity.fragmentManager
-            .beginTransaction().replace(android.R.id.content, MainFragment())
+            .beginTransaction().replace(R.id.webview_container, MainFragment())
             .commitAllowingStateLoss()
     }
 

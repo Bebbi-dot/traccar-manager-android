@@ -1,5 +1,5 @@
-/*
- * Copyright 2016 - 2022 Anton Tananaev (anton@traccar.org)
+﻿/*
+ * Copyright 2016 - 2023 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,111 @@
 package org.traccar.manager
 
 import android.content.Intent
-import android.os.Build
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
-import android.webkit.WebViewFragment
-import androidx.annotation.RequiresApi
+import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import androidx.preference.PreferenceManager
 
 class MainActivity : AppCompatActivity() {
 
     var pendingEventId: Long? = null
+
+    // --- Kompass (JS-basiert im WebView) ---
+    private var compassVisible = false
+
+    // Sensoren
+    private lateinit var sensorManager: SensorManager
+    private var magnetometer: Sensor? = null
+    private var accelerometer: Sensor? = null
+    private val magneticFieldValues = FloatArray(3)
+    private val accelerometerValues = FloatArray(3)
+    private var hasMagneticField = false
+    private var hasAccelerometer = false
+    private var lastAzimuth = 0f
+
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            when (event.sensor.type) {
+                Sensor.TYPE_ROTATION_VECTOR -> {
+                    val rotationMatrix = FloatArray(9)
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                    val orientation = FloatArray(3)
+                    SensorManager.getOrientation(rotationMatrix, orientation)
+                    val azimuthDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+                    lastAzimuth = (azimuthDeg + 360) % 360
+                    if (compassVisible) sendAzimuthToWeb()
+                }
+                Sensor.TYPE_MAGNETIC_FIELD -> {
+                    System.arraycopy(event.values, 0, magneticFieldValues, 0, 3)
+                    hasMagneticField = true
+                    computeOrientationFromFusion()
+                }
+                Sensor.TYPE_ACCELEROMETER -> {
+                    System.arraycopy(event.values, 0, accelerometerValues, 0, 3)
+                    hasAccelerometer = true
+                    computeOrientationFromFusion()
+                }
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun computeOrientationFromFusion() {
+        if (!hasMagneticField || !hasAccelerometer) return
+        val rotationMatrix = FloatArray(9)
+        val inclinationMatrix = FloatArray(9)
+        if (SensorManager.getRotationMatrix(rotationMatrix, inclinationMatrix, accelerometerValues, magneticFieldValues)) {
+            val orientation = FloatArray(3)
+            SensorManager.getOrientation(rotationMatrix, orientation)
+            val azimuthDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+            lastAzimuth = (azimuthDeg + 360) % 360
+            if (compassVisible) sendAzimuthToWeb()
+        }
+    }
+
+    private fun sendAzimuthToWeb() {
+        Log.d(TAG, "sendAzimuth: azimuth=$lastAzimuth")
+        val fragment = fragmentManager.findFragmentById(R.id.webview_container) as? MainFragment
+        fragment?.webView?.evaluateJavascript(
+            "window.__compassAzimuth=$lastAzimuth;",
+            null
+        )
+    }
+
+    inner class CompassInterface {
+        @android.webkit.JavascriptInterface
+        fun setTarget(lat: Double, lng: Double, label: String) {
+            Log.d(TAG, "setTarget: $label lat=$lat lon=$lng")
+        }
+        @android.webkit.JavascriptInterface
+        fun clearTarget() {
+            Log.d(TAG, "clearTarget")
+        }
+        @android.webkit.JavascriptInterface
+        fun startCompass() {
+            runOnUiThread {
+                compassVisible = true
+                magnetometer?.let {
+                    sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+                }
+                accelerometer?.let {
+                    sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+                }
+                Log.d(TAG, "startCompass: magnetometer=${magnetometer!=null} accelerometer=${accelerometer!=null}")
+            }
+        }
+        @android.webkit.JavascriptInterface
+        fun stopCompass() {
+            runOnUiThread {
+                compassVisible = false
+                sensorManager.unregisterListener(sensorListener)
+            }
+        }
+    }
 
     private fun updateEventId(intent: Intent?) {
         intent?.getStringExtra("eventId")?.let { pendingEventId = it.toLongOrNull() }
@@ -36,18 +130,49 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        if (magnetometer == null) {
+            magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+            accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            Log.d(TAG, "sensor: TYPE_ROTATION_VECTOR NULL, fallback MAGNETIC_FIELD=${magnetometer!=null} ACCELEROMETER=${accelerometer!=null}")
+        } else {
+            Log.d(TAG, "sensor: TYPE_ROTATION_VECTOR OK")
+        }
+
         updateEventId(intent)
-        if (savedInstanceState == null) {
-            initContent()
+        initContent()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (compassVisible) {
+            magnetometer?.let {
+                sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+            }
+            accelerometer?.let {
+                sensorManager.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+            }
         }
     }
 
-    private fun initContent() {
-        if (PreferenceManager.getDefaultSharedPreferences(this).contains(PREFERENCE_URL)) {
-            fragmentManager.beginTransaction().add(android.R.id.content, MainFragment()).commit()
-        } else {
-            fragmentManager.beginTransaction().add(android.R.id.content, StartFragment()).commit()
+    override fun onPause() {
+        super.onPause()
+        if (compassVisible) {
+            sensorManager.unregisterListener(sensorListener)
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        sensorManager.unregisterListener(sensorListener)
+    }
+
+    private fun initContent() {
+        val ft = fragmentManager.beginTransaction()
+        ft.add(R.id.webview_container, MainFragment())
+        ft.commit()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -56,15 +181,8 @@ class MainActivity : AppCompatActivity() {
         LocalBroadcastManager.getInstance(this).sendBroadcast(Intent(MainFragment.EVENT_EVENT))
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.M)
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        val fragment = fragmentManager.findFragmentById(android.R.id.content)
-        fragment?.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-    }
-
     override fun onBackPressed() {
-        val fragment = fragmentManager.findFragmentById(android.R.id.content) as? WebViewFragment
+        val fragment = fragmentManager.findFragmentById(R.id.webview_container) as? android.webkit.WebViewFragment
         if (fragment?.webView?.canGoBack() == true) {
             fragment.webView.goBack()
         } else {
@@ -72,7 +190,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    companion object {
+    companion object { private val TAG = "TrackerCompass"
         const val PREFERENCE_URL = "url"
     }
 }
+
+
